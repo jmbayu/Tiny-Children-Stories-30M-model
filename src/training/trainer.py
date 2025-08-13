@@ -125,6 +125,19 @@ class Trainer:
         self.model.train()
         return out
 
+    def reduce_batch_size_on_oom(self):
+        """Reduce batch size upon CUDA Out of Memory error."""
+        self.optimizer.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        new_batch_size = self.batch_size // 2
+        if new_batch_size < 1:
+            raise RuntimeError("Batch size cannot be reduced further. OOM error persists.")
+
+        print(f"CUDA out of memory. Reducing batch size from {self.batch_size} to {new_batch_size} and retrying.")
+        self.batch_size = new_batch_size
+
     def check_disk_space(self, required_space_mb=1000):
         """Check if there's enough disk space for saving the model"""
         try:
@@ -189,31 +202,41 @@ class Trainer:
         
         try:
             # Initialize training
-            X, Y = self.get_batch('train')
             best_loss = float('inf')
             current_loss = None
             
             for iter_num in range(self.current_iter, self.max_iters):
                 self.current_iter = iter_num
                 
-                # Determine and set the learning rate for this iteration
-                lr = self.get_lr(iter_num)
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = lr
-                self.learning_rates.append(lr)
-                
-                # Forward pass with mixed precision
-                with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
-                    logits, loss = self.model(X, Y)
-                current_loss = loss.item()
-                
-                # Backward pass with gradient scaling
-                self.optimizer.zero_grad(set_to_none=True)
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                # Training step with OOM handling
+                while True:
+                    try:
+                        # Get a batch of data
+                        X, Y = self.get_batch('train')
+
+                        # Determine and set the learning rate for this iteration
+                        lr = self.get_lr(iter_num)
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = lr
+
+                        # Forward pass with mixed precision
+                        with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
+                            logits, loss = self.model(X, Y)
+                        current_loss = loss.item()
+
+                        # Backward pass with gradient scaling
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.scaler.scale(loss).backward()
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+
+                        # Append learning rate after successful step
+                        self.learning_rates.append(lr)
+                        break  # Exit loop if successful
+                    except torch.cuda.OutOfMemoryError:
+                        self.reduce_batch_size_on_oom()
                 
                 # Track training loss
                 self.train_losses.append(current_loss)
