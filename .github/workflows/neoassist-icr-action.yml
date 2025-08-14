@@ -1,0 +1,42 @@
+
+       name: neoassist-intelligent-code-reviewer
+       on:
+         pull_request:
+           types:
+             - opened
+             - reopened
+             - synchronize
+       permissions: write-all
+       jobs:
+         genai_pr_review:
+           environment: AI
+           runs-on:
+             - codebuild-neoassist-icr-Tiny-Children-Stories-30M-model-${{ github.run_id }}-${{ github.run_attempt }}
+           steps:
+             - name: Checkout code
+               uses: actions/checkout@v2
+ 
+             - name: intelligent-code-review
+               # Use specific version instead of master for stable releases
+               uses: GenAI/intelligent-code-review@master
+               with:
+                 # Required: Needed to access the Nexus API. Needs to be set as a secret in the repository settings.
+                 OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+                 # Required: Needed to call github apis.
+                 GITHUB_TOKEN: ${{ secrets.GH_ENTERPRISE_PAT }}
+                 # Optional: Path to checklist for the PR review.
+                 # Example: 'path/to/checklist.txt'. If not given the default checklist will be used.
+                 # Example: If your checklist.txt is present in root repo i.e <your-repo-root>/checklist.txt then pass PR_CHECKLIST: 'checklist.txt'
+                 PR_CHECKLIST: 'PRChecklist.txt'
+                 # Optional: A list of space separated strings that will be used to exclude files or matching files from the diff analysis.
+                 # Example: '*.yaml docs/* Readme.md' This will exclude all yaml files, files in the docs directory and the Readme.md file.
+                 EXCLUDE_FILES: '*.yaml *.json deployment/* public/*'
+                 # Optional: Comma-separated values for review severity levels.
+                 # Example: 'CRITICAL,MAJOR,IMPROVEMENT,SUGGESTIONS'
+                 # Default: 'CRITICAL,MAJOR'
+                 REVIEW_SEVERITY: 'CRITICAL,MAJOR,IMPROVEMENT'
+                 # Optional: GPT model to use for code review. Either gpt-4o or gpt-4o-mini. Use the same model for which you requested the api key.
+                 # Example: 'gpt-4o-mini'
+                 # Default: 'gpt-4o'
+                 GPT_MODEL: 'gpt-4o'
+       
