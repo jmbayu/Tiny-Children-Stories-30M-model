@@ -16,6 +16,11 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
+def print_gpu_memory(message: str):
+    """Print current GPU memory usage"""
+    if torch.cuda.is_available():
+        print(f"\r{message}: VRAM in GB Available: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}, allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f}, reserved: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+
 class Trainer:
     def __init__(self, model, optimizer, device, batch_size, max_iters, eval_interval, eval_iters, learning_rate, weight_decay, warmup_iters, lr_decay_iters, min_lr, checkpoint_dir='checkpoints'):
         self.model = model
@@ -58,6 +63,11 @@ class Trainer:
         self.data = self.load_data()
         self.n = len(self.data)
 
+        # Dynamically adjust batch size to fit 80% of GPU memory if using CUDA
+        if self.device.startswith('cuda') and torch.cuda.is_available():
+            self.batch_size = self._find_max_batch_size_within_vram(target_utilization=0.8)
+            print(f"[Trainer] Adjusted batch size to {self.batch_size} to fit within 80% of GPU VRAM.")
+
     def load_data(self):
         """Load the training data"""
         try:
@@ -84,9 +94,11 @@ class Trainer:
             x = torch.stack([self.data[i:i+self.model.config.block_size].long() for i in ix])
             # Get target sequences (shifted by 1)
             y = torch.stack([self.data[i+1:i+1+self.model.config.block_size].long() for i in ix])
-            
+
             # Move to device
             x, y = x.to(self.device), y.to(self.device)
+            
+            # print_gpu_memory(f"After Move to device")
             return x, y
         except Exception as e:
             print(f"Error in get_batch: {str(e)}")
@@ -112,10 +124,11 @@ class Trainer:
         for split in ['train', 'val']:
             losses = torch.zeros(self.eval_iters)
             for k in range(self.eval_iters):
+                print_gpu_memory(f"{k} ./. {self.eval_iters}")
                 try:
                     X, Y = self.get_batch(split)
                     with torch.no_grad():
-                        with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
+                        with torch.amp.autocast('cuda', enabled=(self.device == 'cuda')):
                             logits, loss = self.model(X, Y)
                     losses[k] = loss.item()
                 except Exception as e:
@@ -124,19 +137,6 @@ class Trainer:
             out[split] = losses.mean()
         self.model.train()
         return out
-
-    def reduce_batch_size_on_oom(self):
-        """Reduce batch size upon CUDA Out of Memory error."""
-        self.optimizer.zero_grad(set_to_none=True)
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        new_batch_size = self.batch_size // 2
-        if new_batch_size < 1:
-            raise RuntimeError("Batch size cannot be reduced further. OOM error persists.")
-
-        print(f"CUDA out of memory. Reducing batch size from {self.batch_size} to {new_batch_size} and retrying.")
-        self.batch_size = new_batch_size
 
     def check_disk_space(self, required_space_mb=1000):
         """Check if there's enough disk space for saving the model"""
@@ -195,6 +195,33 @@ class Trainer:
             print(f"Error loading checkpoint: {e}")
             return False
 
+    def _find_max_batch_size_within_vram(self, target_utilization=0.8, min_batch=1, max_batch=None):
+        """Estimate the largest batch size that fits within target_utilization of GPU VRAM."""
+        torch.cuda.empty_cache()
+        total_mem = torch.cuda.get_device_properties(0).total_memory
+        max_mem = int(total_mem * target_utilization)
+        # Use initial batch size as upper bound if not specified
+        if max_batch is None:
+            max_batch = self.batch_size
+        block_size = getattr(self.model.config, 'block_size', 128)
+        dtype_size = 2  # Assume fp16 (float16) for mixed precision
+        # Try decreasing batch size until it fits
+        for batch in range(max_batch, min_batch - 1, -1):
+            try:
+                dummy_x = torch.zeros((batch, block_size), dtype=torch.long, device=self.device)
+                dummy_y = torch.zeros((batch, block_size), dtype=torch.long, device=self.device)
+                with torch.amp.autocast("cuda", enabled=True):
+                    _ = self.model(dummy_x, dummy_y)
+                used = torch.cuda.max_memory_allocated(0)
+                torch.cuda.empty_cache()
+                if used < max_mem:
+                    return batch
+            except RuntimeError:
+                torch.cuda.empty_cache()
+                continue
+        print("[Trainer] Warning: Could not fit even the minimum batch size in GPU memory. Using min_batch.")
+        return min_batch
+
     def train(self):
         """Train the model"""
         print(f"Training started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -202,41 +229,32 @@ class Trainer:
         
         try:
             # Initialize training
+            X, Y = self.get_batch('train')
             best_loss = float('inf')
             current_loss = None
             
             for iter_num in range(self.current_iter, self.max_iters):
                 self.current_iter = iter_num
+                print_gpu_memory(f"{self.current_iter} .. {self.max_iters}")
+                # Determine and set the learning rate for this iteration
+                lr = self.get_lr(iter_num)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
+                self.learning_rates.append(lr)
                 
-                # Training step with OOM handling
-                while True:
-                    try:
-                        # Get a batch of data
-                        X, Y = self.get_batch('train')
-
-                        # Determine and set the learning rate for this iteration
-                        lr = self.get_lr(iter_num)
-                        for param_group in self.optimizer.param_groups:
-                            param_group['lr'] = lr
-
-                        # Forward pass with mixed precision
-                        with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
-                            logits, loss = self.model(X, Y)
-                        current_loss = loss.item()
-
-                        # Backward pass with gradient scaling
-                        self.optimizer.zero_grad(set_to_none=True)
-                        self.scaler.scale(loss).backward()
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-
-                        # Append learning rate after successful step
-                        self.learning_rates.append(lr)
-                        break  # Exit loop if successful
-                    except torch.cuda.OutOfMemoryError:
-                        self.reduce_batch_size_on_oom()
+                # Forward pass with mixed precision
+                #with torch.cuda.amp.autocast(enabled=(self.device == 'cuda')):
+                with torch.amp.autocast('cuda', enabled=(self.device.startswith('cuda'))):
+                    logits, loss = self.model(X, Y)
+                current_loss = loss.item()
+                
+                # Backward pass with gradient scaling
+                self.optimizer.zero_grad(set_to_none=True)
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 
                 # Track training loss
                 self.train_losses.append(current_loss)
@@ -310,4 +328,4 @@ class Trainer:
         # Save plot
         plt.tight_layout()
         plt.savefig(os.path.join(self.checkpoint_dir, 'training_metrics.png'))
-        plt.close() 
+        plt.close()
