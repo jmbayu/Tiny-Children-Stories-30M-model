@@ -13,6 +13,7 @@
            runs-on:
              - codebuild-neoassist-icr-Tiny-Children-Stories-30M-model-${{ github.run_id }}-${{ github.run_attempt }}
              - os-small-amd64-linux
+             - Windows
            steps:
              - name: Checkout code
                uses: actions/checkout@v2
