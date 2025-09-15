@@ -195,3 +195,5 @@ cython_debug/
 src/data/*.bin
 src/model/*.bin
 src/training/*.bin
+checkpoints/
+src/training/checkpoints
